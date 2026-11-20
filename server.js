@@ -1,0 +1,113 @@
+// Orb Rush 3D - servidor: entrega o jogo e conecta os jogadores pelo codigo da sala.
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { WebSocketServer } = require('ws');
+
+const PORT = process.env.PORT || 3000;
+const MAX_PLAYERS = 8;
+// Aceita o index.html dentro de /public ou solto ao lado do server.js
+const candidatos = [path.join(__dirname, 'public', 'index.html'), path.join(__dirname, 'index.html')];
+const arquivo = candidatos.find(f => fs.existsSync(f));
+if (!arquivo) { console.error('index.html nao encontrado'); process.exit(1); }
+const page = fs.readFileSync(arquivo);
+
+const server = http.createServer((req, res) => {
+  const url = (req.url || '/').split('?')[0];
+  if (url === '/health') { res.writeHead(200); return res.end('ok'); }
+  if (url === '/' || url === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+    return res.end(page);
+  }
+  res.writeHead(404); res.end('not found');
+});
+
+const wss = new WebSocketServer({ server, maxPayload: 16384 });
+const rooms = new Map(); // nome da sala -> Map(id -> cliente)
+let nextId = 1;
+
+const send = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
+const num = (v, min, max) => { v = +v; return isFinite(v) ? Math.max(min, Math.min(max, v)) : 0; };
+
+// Aceita so os campos esperados (ninguem consegue mandar lixo para os outros)
+function clean(p) {
+  if (!p || typeof p !== 'object') return null;
+  const o = {
+    x: num(p.x, -100, 100), z: num(p.z, -100, 100), r: num(p.r, -7, 7),
+    s: Math.floor(num(p.s, 0, 999)), h: num(p.h, 0, 1),
+    n: typeof p.n === 'string' ? p.n.replace(/[^\p{L}\p{N} _.-]/gu, '').slice(0, 12) : '',
+    a: typeof p.a === 'string' && /^g\d{1,2}$/.test(p.a) ? p.a : ''
+  };
+  if (Array.isArray(p.e) && p.e.length === 2) o.e = [Math.floor(num(p.e[0], 0, 9)), Math.floor(num(p.e[1], 0, 1e9))];
+  if (Array.isArray(p.g)) {
+    o.g = p.g.slice(0, 6)
+      .map(a => Array.isArray(a) ? [Math.floor(num(a[0], 0, 99)), Math.floor(num(a[1], 0, 1e6)), num(a[2], 0, 1e14)] : null)
+      .filter(Boolean);
+  }
+  return o;
+}
+
+function broadcast(room, from, msg) {
+  const r = rooms.get(room);
+  if (!r) return;
+  r.forEach(c => { if (c !== from) send(c, msg); });
+}
+
+wss.on('connection', ws => {
+  ws.id = nextId++;
+  ws.room = null;
+  ws.p = null;
+  ws.alive = true;
+  ws.tokens = 120;
+  ws.t = Date.now();
+  ws.on('pong', () => { ws.alive = true; });
+
+  ws.on('message', data => {
+    const now = Date.now();
+    ws.tokens = Math.min(120, ws.tokens + (now - ws.t) / 1000 * 80); ws.t = now;
+    if (ws.tokens < 1) return;
+    ws.tokens--;
+    let m; try { m = JSON.parse(data); } catch (e) { return; }
+    if (!m || typeof m !== 'object') return;
+
+    if (m.t === 'join' && !ws.room) {
+      const name = String(m.room || '').toLowerCase();
+      if (!/^[a-z0-9-]{3,24}$/.test(name)) { ws.close(); return; }
+      let r = rooms.get(name);
+      if (!r) { r = new Map(); rooms.set(name, r); }
+      if (r.size >= MAX_PLAYERS) { send(ws, { t: 'full' }); ws.close(); return; }
+      ws.room = name;
+      send(ws, { t: 'welcome', id: ws.id, peers: [...r.values()].filter(c => c.p).map(c => ({ id: c.id, p: c.p })) });
+      r.set(ws.id, ws);
+    } else if (m.t === 'sig' && ws.room) {
+      // sinalizacao do chat de voz: so repassa para outro jogador da mesma sala
+      const r = rooms.get(ws.room);
+      const to = r && r.get(+m.to);
+      if (to && to !== ws && m.d && typeof m.d === 'object') send(to, { t: 'sig', from: ws.id, d: m.d });
+    } else if (m.t === 'p' && ws.room) {
+      const p = clean(m.p);
+      if (!p) return;
+      ws.p = p;
+      broadcast(ws.room, ws, { t: 'p', id: ws.id, p });
+    }
+  });
+
+  ws.on('close', () => {
+    if (!ws.room) return;
+    const r = rooms.get(ws.room);
+    if (!r) return;
+    r.delete(ws.id);
+    if (r.size === 0) rooms.delete(ws.room);
+    else broadcast(ws.room, ws, { t: 'left', id: ws.id });
+  });
+});
+
+// Derruba conexoes mortas
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (!ws.alive) return ws.terminate();
+    ws.alive = false; ws.ping();
+  });
+}, 30000);
+
+server.listen(PORT, () => console.log('Orb Rush 3D rodando na porta ' + PORT));

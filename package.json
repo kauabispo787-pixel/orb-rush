@@ -1,0 +1,9 @@
+{
+  "name": "orb-rush-server",
+  "version": "1.0.0",
+  "description": "Servidor do Orb Rush 3D (jogo + multiplayer por codigo)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "ws": "^8.18.0" },
+  "engines": { "node": ">=18" }
+}
